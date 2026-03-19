@@ -1,0 +1,3 @@
+git status
+git add .
+git commit -m "Initial commit: PhonePe Pulse ETL pipeline and Streamlit dashboard"

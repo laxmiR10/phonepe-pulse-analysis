@@ -1,256 +1,428 @@
+# ============================================================
+# App bootstrap (DO NOT MOVE)
+# ============================================================
+import sys
+import os
+
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
+
+# ============================================================
+# Imports
+# ============================================================
+import json
 import streamlit as st
 import pandas as pd
 import plotly.express as px
-import requests
-from sqlalchemy import create_engine
 
-# ---------------- PAGE CONFIG ----------------
+from etl.db_utils import get_engine
+
+# ============================================================
+# Page config
+# ============================================================
 st.set_page_config(
     page_title="PhonePe Pulse Dashboard",
     layout="wide"
 )
 
-# ---------------- DB CONNECTION ----------------
-engine = create_engine(
-    "mysql+mysqlconnector://root:YOUR_PASSWORD@localhost/phonepe_pulse"
-)
+# ============================================================
+# Database connection
+# ============================================================
+engine = get_engine()
 
-# ---------------- CONSTANTS ----------------
-DISTRICT_GEOJSON_MAP = {
-    "Karnataka": "karnataka",
-    "Tamil Nadu": "tamil_nadu",
-    "Maharashtra": "maharashtra",
-    "Kerala": "kerala",
-    "Andhra Pradesh": "andhra_pradesh",
-    "Telangana": "telangana",
-    "Uttar Pradesh": "uttar_pradesh",
-    "Gujarat": "gujarat",
-    "Rajasthan": "rajasthan",
-    "West Bengal": "west_bengal"
-}
+# ============================================================
+# Helper functions
+# ============================================================
+def normalize_state(name: str) -> str:
+    mapping = {
+        "Andaman & Nicobar Islands": "Andaman and Nicobar",
+        "Dadra & Nagar Haveli & Daman & Diu": "Dadra and Nagar Haveli",
+        "Jammu & Kashmir": "Jammu and Kashmir",
+        "Odisha": "Orissa",
+        "Uttarakhand": "Uttaranchal",
+        # GeoJSON limitations
+        "Ladakh": "Jammu and Kashmir",
+        "Telangana": "Andhra Pradesh",
+    }
+    return mapping.get(name, name)
 
-SUPPORTED_DISTRICT_STATES = sorted(DISTRICT_GEOJSON_MAP.keys())
 
-# ---------------- HELPERS ----------------
+def normalize_state_for_district(state: str) -> str:
+    if state in ["Ladakh", "Jammu & Kashmir"]:
+        return "Jammu and Kashmir"
+    return normalize_state(state)
+
+def normalize_district(name: str) -> str:
+    name = name.lower()
+
+    replacements = [
+        " district",
+        " districts",
+        " urban",
+        " rural",
+        " metropolitan",
+        " city"
+    ]
+
+    for r in replacements:
+        name = name.replace(r, "")
+
+    return name.strip().title()
+
 @st.cache_data
-def load_district_geojson(state_name):
-    key = DISTRICT_GEOJSON_MAP.get(state_name)
-    if not key:
-        return None
+def load_state_geojson():
+    with open("data/india_states.geojson", "r", encoding="utf-8") as f:
+        return json.load(f)
 
-    url = (
-        "https://raw.githubusercontent.com/datameet/maps/master/"
-        f"Districts/{key}.geojson"
+
+@st.cache_data
+def load_district_geojson():
+    with open("data/india_districts.geojson", "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+@st.cache_data
+def load_years():
+    return sorted(
+        pd.read_sql(
+            "SELECT DISTINCT year FROM aggregated_transaction ORDER BY year",
+            engine
+        )["year"]
     )
-    response = requests.get(url)
-    if response.status_code == 200:
-        return response.json()
-    return None
 
-# ---------------- TITLE ----------------
-st.title("📊 PhonePe Pulse Data Analysis Dashboard")
-
-# ---------------- SIDEBAR FILTERS ----------------
-st.sidebar.header("Filters")
+# ============================================================
+# Sidebar filters
+# ============================================================
+st.sidebar.title("Filters")
 
 year = st.sidebar.selectbox(
     "Select Year",
-    sorted(pd.read_sql(
-        "SELECT DISTINCT year FROM aggregated_transaction ORDER BY year",
-        engine
-    )["year"])
+    load_years(),
+    key="sidebar_year"
 )
 
-quarter = st.sidebar.selectbox("Select Quarter", [1, 2, 3, 4])
-
-metric = st.sidebar.radio(
-    "Select Metric",
-    ["Transaction Amount", "Transaction Count"]
+quarter = st.sidebar.selectbox(
+    "Select Quarter",
+    [1, 2, 3, 4],
+    key="sidebar_quarter"
 )
 
-metric_column = "txn_amount" if metric == "Transaction Amount" else "txn_count"
-
-# ---------------- TABS ----------------
-tab1, tab2, tab3, tab4, tab5 = st.tabs(
-    ["Transactions", "Users", "Top Performers", "🗺️ Maps", "🛡️ Insurance"]
+st.sidebar.caption(
+    "Changing filters updates all charts and maps."
 )
 
-# =================================================
-# TAB 1: TRANSACTIONS
-# =================================================
-with tab1:
-    df_txn = pd.read_sql(f"""
-        SELECT state, SUM({metric_column}) AS value
+# ============================================================
+# Page title & tabs
+# ============================================================
+st.title("📊 PhonePe Pulse Transaction Analysis")
+
+tab_txn, tab_users, tab_top, tab_maps, tab_ins = st.tabs(
+    ["💳 Transactions", "👥 Users", "🏆 Top Performers", "🗺️ Maps", "🛡️ Insurance"]
+)
+
+# ============================================================
+# TRANSACTIONS TAB
+# ============================================================
+with tab_txn:
+    st.subheader("Top States by Transaction Amount")
+
+    df_txn_state = pd.read_sql(
+        f"""
+        SELECT state, SUM(txn_amount) AS total_amount
         FROM aggregated_transaction
         WHERE year = {year} AND quarter = {quarter}
         GROUP BY state
-        ORDER BY value DESC
-        LIMIT 10;
-    """, engine)
+        ORDER BY total_amount DESC
+        LIMIT 10
+        """,
+        engine
+    )
 
     st.plotly_chart(
-        px.bar(df_txn, x="state", y="value",
-               title=f"Top States by {metric} ({year} Q{quarter})"),
+        px.bar(
+            df_txn_state,
+            x="state",
+            y="total_amount",
+            title="Top 10 States by Transaction Amount"
+        ),
         use_container_width=True
     )
 
-# =================================================
-# TAB 2: USERS
-# =================================================
-with tab2:
-    df_user = pd.read_sql(f"""
+    st.subheader("Transaction Breakdown by Category")
+
+    df_txn_type = pd.read_sql(
+        f"""
+        SELECT transaction_type, SUM(txn_amount) AS amount
+        FROM aggregated_transaction
+        WHERE year = {year} AND quarter = {quarter}
+        GROUP BY transaction_type
+        """,
+        engine
+    )
+
+    st.plotly_chart(
+        px.pie(
+            df_txn_type,
+            names="transaction_type",
+            values="amount",
+            title="Transaction Amount by Category"
+        ),
+        use_container_width=True
+    )
+
+# ============================================================
+# USERS TAB
+# ============================================================
+with tab_users:
+    st.subheader("User Engagement by State")
+
+    df_users = pd.read_sql(
+        """
         SELECT state,
                SUM(registered_users) AS users,
                SUM(app_opens) AS app_opens
         FROM map_user
-        WHERE year = {year} AND quarter = {quarter}
         GROUP BY state
         ORDER BY users DESC
-        LIMIT 10;
-    """, engine)
+        LIMIT 10
+        """,
+        engine
+    )
 
     st.plotly_chart(
-        px.bar(df_user, x="state",
-               y=["users", "app_opens"],
-               barmode="group",
-               title="Registered Users vs App Opens"),
+        px.bar(
+            df_users,
+            x="state",
+            y=["users", "app_opens"],
+            barmode="group",
+            title="User Engagement Metrics"
+        ),
         use_container_width=True
     )
 
-# =================================================
-# TAB 3: TOP PERFORMERS
-# =================================================
-with tab3:
-    state_tp = st.selectbox(
+# ============================================================
+# TOP PERFORMERS TAB
+# ============================================================
+with tab_top:
+    st.subheader("Top Districts by Transaction Amount")
+
+    state_selected = st.selectbox(
         "Select State",
-        sorted(pd.read_sql(
-            "SELECT DISTINCT state FROM map_transaction ORDER BY state",
-            engine
-        )["state"])
+        sorted(
+            pd.read_sql(
+                "SELECT DISTINCT state FROM map_transaction ORDER BY state",
+                engine
+            )["state"]
+        ),
+        key="top_state_select"
     )
 
-    df_dist = pd.read_sql(f"""
-        SELECT district, SUM({metric_column}) AS value
+    df_top_dist = pd.read_sql(
+        f"""
+        SELECT district, SUM(txn_amount) AS total_amount
         FROM map_transaction
-        WHERE state = '{state_tp}'
+        WHERE state = '{state_selected}'
           AND year = {year}
           AND quarter = {quarter}
         GROUP BY district
-        ORDER BY value DESC
-        LIMIT 10;
-    """, engine)
+        ORDER BY total_amount DESC
+        LIMIT 10
+        """,
+        engine
+    )
 
     st.plotly_chart(
-        px.bar(df_dist, x="district", y="value",
-               title=f"Top Districts in {state_tp}"),
+        px.bar(
+            df_top_dist,
+            x="district",
+            y="total_amount",
+            title=f"Top Districts in {state_selected}"
+        ),
         use_container_width=True
     )
 
-# =================================================
-# TAB 4: MAPS
-# =================================================
-with tab4:
-    map_state = st.selectbox(
-        "Select State (District Map Available)",
-        SUPPORTED_DISTRICT_STATES
-    )
+# ============================================================
+# MAPS TAB
+# ============================================================
+with tab_maps:
+    st.subheader("🗺️ Transaction Amount by State")
 
-    # State-level map
-    df_state_map = pd.read_sql(f"""
-        SELECT state, SUM({metric_column}) AS value
+    # ---------------- STATE MAP ----------------
+    df_state = pd.read_sql(
+        f"""
+        SELECT state, SUM(txn_amount) AS total_amount
         FROM aggregated_transaction
         WHERE year = {year} AND quarter = {quarter}
-        GROUP BY state;
-    """, engine)
-
-    st.plotly_chart(
-        px.choropleth(
-            df_state_map,
-            geojson="https://gist.githubusercontent.com/jbrobst/56c13bbbf9d97d187fea01ca62ea5112/raw/india_states.geojson",
-            featureidkey="properties.ST_NM",
-            locations="state",
-            color="value",
-            color_continuous_scale="Blues",
-            title=f"{metric} by State"
-        ).update_geos(fitbounds="locations", visible=False),
-        use_container_width=True
+        GROUP BY state
+        """,
+        engine
     )
 
-    # District-level map
-    geojson = load_district_geojson(map_state)
+    # Normalize state names for GeoJSON
+    df_state["state"] = df_state["state"].apply(normalize_state)
 
-    df_district = pd.read_sql(f"""
-        SELECT district, SUM({metric_column}) AS value
+    fig_state = px.choropleth(
+        df_state,
+        geojson=load_state_geojson(),
+        locations="state",
+        featureidkey="properties.NAME_1",
+        color="total_amount",
+        hover_name="state",
+        hover_data={"total_amount": ":,.0f"},
+        color_continuous_scale="Blues",
+        title="Transaction Amount by State"
+    )
+
+    fig_state.update_geos(fitbounds="locations", visible=False)
+    st.plotly_chart(fig_state, use_container_width=True)
+
+    st.caption(
+        "White regions indicate zero or unavailable transaction data for the selected period."
+    )
+
+    st.divider()
+
+    # ---------------- DISTRICT MAP ----------------
+    st.subheader("📍 Transaction Amount by District")
+
+    # IMPORTANT: use ORIGINAL DB state names for SQL
+    map_state = st.selectbox(
+        "Select State",
+        sorted(
+            pd.read_sql(
+                "SELECT DISTINCT state FROM map_transaction ORDER BY state",
+                engine
+            )["state"]
+        ),
+        key="district_map_state"
+    )
+
+    df_dist = pd.read_sql(
+        f"""
+        SELECT district, SUM(txn_amount) AS total_amount
         FROM map_transaction
         WHERE state = '{map_state}'
           AND year = {year}
           AND quarter = {quarter}
-        GROUP BY district;
-    """, engine)
-
-    st.plotly_chart(
-        px.choropleth(
-            df_district,
-            geojson=geojson,
-            featureidkey="properties.DISTRICT",
-            locations="district",
-            color="value",
-            color_continuous_scale="Reds",
-            title=f"{metric} by District – {map_state}"
-        ).update_geos(fitbounds="locations", visible=False),
-        use_container_width=True
+        GROUP BY district
+        """,
+        engine
     )
 
-# =================================================
-# TAB 5: INSURANCE
-# =================================================
-with tab5:
-    df_ins = pd.read_sql("""
-        SELECT state, year, quarter,
-               SUM(insurance_amount) AS total_amount,
-               SUM(insurance_count) AS total_count
-        FROM aggregated_insurance
-        GROUP BY state, year, quarter;
-    """, engine)
+    if df_dist.empty:
+        st.warning("No district data available for this state.")
+        st.stop()
 
-    df_filtered = df_ins[
-        (df_ins["year"] == year) &
-        (df_ins["quarter"] == quarter)
+    # -------- Normalize district names (GENERIC, ALL STATES) --------
+    df_dist["district_clean"] = df_dist["district"].apply(normalize_district)
+
+    geo_state = normalize_state_for_district(map_state)
+    full_geojson = load_district_geojson()
+
+    # Filter GeoJSON to selected state
+    district_geojson = {
+        "type": "FeatureCollection",
+        "features": [
+            f for f in full_geojson["features"]
+            if f["properties"].get("NAME_1") == geo_state
+        ]
+    }
+
+    # Normalize district names INSIDE GeoJSON
+    for f in district_geojson["features"]:
+        f["properties"]["district_clean"] = normalize_district(
+            f["properties"].get("NAME_2", "")
+        )
+
+    # Keep only districts that exist in GeoJSON
+    geo_districts = {
+        f["properties"]["district_clean"]
+        for f in district_geojson["features"]
+    }
+
+    df_dist_matched = df_dist[
+        df_dist["district_clean"].isin(geo_districts)
     ]
 
-    if df_filtered.empty:
-        latest_year = df_ins["year"].max()
-        latest_quarter = df_ins[df_ins["year"] == latest_year]["quarter"].max()
-        df_filtered = df_ins[
-            (df_ins["year"] == latest_year) &
-            (df_ins["quarter"] == latest_quarter)
-        ]
-        st.warning("Showing latest available insurance data.")
-
-    metric_ins = st.radio(
-        "Insurance Metric",
-        ["Insurance Amount", "Insurance Count"],
-        horizontal=True
+    fig_dist = px.choropleth(
+        df_dist_matched,
+        geojson=district_geojson,
+        locations="district_clean",
+        featureidkey="properties.district_clean",
+        color="total_amount",
+        hover_name="district",
+        hover_data={"total_amount": ":,.0f"},
+        color_continuous_scale="Reds",
+        title=f"Transaction Amount by District – {map_state}"
     )
 
-    col = "total_amount" if metric_ins == "Insurance Amount" else "total_count"
+    fig_dist.update_geos(fitbounds="locations", visible=False)
+    st.plotly_chart(fig_dist, use_container_width=True)
+
+    if map_state in ["Ladakh", "Jammu & Kashmir"]:
+        st.caption(
+            "Note: Ladakh and Jammu & Kashmir are merged due to GeoJSON boundary limitations."
+        )
+
+    st.caption(
+        "District-level visualization is exploratory due to administrative name variations."
+    )
+
+    st.caption(
+    "Only districts with matching geographic names are colored. "
+    "Unmatched districts are excluded to ensure accurate visualization."
+    )
+
+# ============================================================
+# INSURANCE TAB
+# ============================================================
+with tab_ins:
+    st.subheader("Insurance Transaction Analysis")
+
+    df_ins_state = pd.read_sql(
+        f"""
+        SELECT state, SUM(insurance_amount) AS amount
+        FROM aggregated_insurance
+        WHERE year = {year} AND quarter = {quarter}
+        GROUP BY state
+        """,
+        engine
+    )
 
     st.plotly_chart(
-        px.bar(df_filtered.sort_values(col, ascending=False).head(10),
-               x="state", y=col,
-               title=f"Top States by {metric_ins}"),
+        px.bar(
+            df_ins_state.sort_values("amount", ascending=False),
+            x="state",
+            y="amount",
+            title="Insurance Amount by State"
+        ),
         use_container_width=True
     )
 
-    st.plotly_chart(
-        px.choropleth(
-            df_filtered,
-            geojson="https://gist.githubusercontent.com/jbrobst/56c13bbbf9d97d187fea01ca62ea5112/raw/india_states.geojson",
-            featureidkey="properties.ST_NM",
-            locations="state",
-            color=col,
-            color_continuous_scale="Greens",
-            title=f"{metric_ins} by State"
-        ).update_geos(fitbounds="locations", visible=False),
+    st.subheader("Top Insurance Regions")
+
+    df_top_ins = pd.read_sql(
+        f"""
+        SELECT
+            state,
+            SUM(insurance_amount) AS insurance_amount
+        FROM top_insurance
+        WHERE year = {year}
+        AND quarter = {quarter}
+        GROUP BY state
+        ORDER BY insurance_amount DESC
+        LIMIT 10
+        """,
+        engine
+    )
+
+    st.caption(
+        "Note: The above table lists the top 10 states by insurance amount for the selected period."
+    )
+
+    st.dataframe(
+        df_top_ins.style.format({"insurance_amount": "{:,.0f}"}),
         use_container_width=True
     )
+

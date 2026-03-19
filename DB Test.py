@@ -1,1 +1,0 @@
-python -c "from etl.db_utils import get_engine; print(get_engine())"
